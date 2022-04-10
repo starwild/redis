@@ -28,11 +28,19 @@
  * POSSIBILITY OF SUCH DAMAGE.
  */
 
+#include "fmacros.h"
+#include "config.h"
+#include "solarisfixes.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <unistd.h>
 #include <assert.h>
+
+#ifdef __linux__
+#include <sys/mman.h>
+#endif
 
 /* This function provide us access to the original libc free(). This is useful
  * for instance to free results obtained by backtrace_symbols(). We need
@@ -44,7 +52,6 @@ void zlibc_free(void *ptr) {
 
 #include <string.h>
 #include <pthread.h>
-#include "config.h"
 #include "zmalloc.h"
 #include "atomicvar.h"
 
@@ -172,6 +179,20 @@ void *ztrycalloc_usable(size_t size, size_t *usable) {
     if (usable) *usable = size;
     return (char*)ptr+PREFIX_SIZE;
 #endif
+}
+
+/* Allocate memory and zero it or panic.
+ * We need this wrapper to have a calloc compatible signature */
+void *zcalloc_num(size_t num, size_t size) {
+    /* Ensure that the arguments to calloc(), when multiplied, do not wrap.
+     * Division operations are susceptible to divide-by-zero errors so we also check it. */
+    if ((size == 0) || (num > SIZE_MAX/size)) {
+        zmalloc_oom_handler(SIZE_MAX);
+        return NULL;
+    }
+    void *ptr = ztrycalloc_usable(num*size, NULL);
+    if (!ptr) zmalloc_oom_handler(num*size);
+    return ptr;
 }
 
 /* Allocate memory and zero it or panic */
@@ -335,6 +356,31 @@ void zmalloc_set_oom_handler(void (*oom_handler)(size_t)) {
     zmalloc_oom_handler = oom_handler;
 }
 
+/* Use 'MADV_DONTNEED' to release memory to operating system quickly.
+ * We do that in a fork child process to avoid CoW when the parent modifies
+ * these shared pages. */
+void zmadvise_dontneed(void *ptr) {
+#if defined(USE_JEMALLOC) && defined(__linux__)
+    static size_t page_size = 0;
+    if (page_size == 0) page_size = sysconf(_SC_PAGESIZE);
+    size_t page_size_mask = page_size - 1;
+
+    size_t real_size = zmalloc_size(ptr);
+    if (real_size < page_size) return;
+
+    /* We need to align the pointer upwards according to page size, because
+     * the memory address is increased upwards and we only can free memory
+     * based on page. */
+    char *aligned_ptr = (char *)(((size_t)ptr+page_size_mask) & ~page_size_mask);
+    real_size -= (aligned_ptr-(char*)ptr);
+    if (real_size >= page_size) {
+        madvise((void *)aligned_ptr, real_size&~page_size_mask, MADV_DONTNEED);
+    }
+#else
+    (void)(ptr);
+#endif
+}
+
 /* Get the RSS information in an OS-specific way.
  *
  * WARNING: the function zmalloc_get_rss() is not designed to be fast
@@ -421,21 +467,27 @@ size_t zmalloc_get_rss(void) {
 
     return 0L;
 }
-#elif defined(__NetBSD__)
+#elif defined(__NetBSD__) || defined(__OpenBSD__)
 #include <sys/types.h>
 #include <sys/sysctl.h>
+
+#if defined(__OpenBSD__)
+#define kinfo_proc2 kinfo_proc
+#define KERN_PROC2 KERN_PROC
+#define __arraycount(a) (sizeof(a) / sizeof(a[0]))
+#endif
 
 size_t zmalloc_get_rss(void) {
     struct kinfo_proc2 info;
     size_t infolen = sizeof(info);
     int mib[6];
     mib[0] = CTL_KERN;
-    mib[1] = KERN_PROC;
+    mib[1] = KERN_PROC2;
     mib[2] = KERN_PROC_PID;
     mib[3] = getpid();
     mib[4] = sizeof(info);
     mib[5] = 1;
-    if (sysctl(mib, 4, &info, &infolen, NULL, 0) == 0)
+    if (sysctl(mib, __arraycount(mib), &info, &infolen, NULL, 0) == 0)
         return (size_t)info.p_vm_rssize * getpagesize();
 
     return 0L;
@@ -680,12 +732,12 @@ size_t zmalloc_get_memory_size(void) {
 
 #ifdef REDIS_TEST
 #define UNUSED(x) ((void)(x))
-int zmalloc_test(int argc, char **argv, int accurate) {
+int zmalloc_test(int argc, char **argv, int flags) {
     void *ptr;
 
     UNUSED(argc);
     UNUSED(argv);
-    UNUSED(accurate);
+    UNUSED(flags);
     printf("Malloc prefix size: %d\n", (int) PREFIX_SIZE);
     printf("Initial used memory: %zu\n", zmalloc_used_memory());
     ptr = zmalloc(123);
